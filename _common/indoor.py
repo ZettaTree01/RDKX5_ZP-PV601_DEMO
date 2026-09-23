@@ -46,6 +46,8 @@ NAV_VEL_MPS = REAL_NAV_VEL_MPS * INDOOR_SPEED_SCALE
 # 油门不能简单按 scale 压到 0.003，电调根本不转。
 # 先封顶 THR_MAX≈0.05（约 600 r/min），再按实飞比例映射三段，并设下限。
 # 悬停油门要明显低于上限，俯仰/横滚时混控才有余量把一侧电机加快、对侧减慢。
+# 这些是姿态设定点里的油门，不写进 PX4 的 MPC_THR_*。
+# MPC_THR_MIN 下限约 0.05、MPC_THR_HOVER 下限约 0.1，室内这组数写进去会被拒绝。
 THR_MAX = 0.05
 _THR_SCALE = THR_MAX / REAL_THR_MAX
 THR_MIN = max(0.015, REAL_THR_MIN * _THR_SCALE)

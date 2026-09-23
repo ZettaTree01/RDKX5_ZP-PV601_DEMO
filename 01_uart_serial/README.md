@@ -95,8 +95,8 @@ python3 /app/zettatree_demo/01_uart_serial/motor_test_via_usb.py --iterate --i-a
 超时后:     1000 1000 1000 1000   ← -t 超时自动停转
 ```
 
-安全约束：必须显式带 `--i-am-sure`；飞控已解锁时拒绝执行；输出值默认上限
-`MPC_THR_MAX=0.05`（对应室内最高 **600 r/min**）；命令带 `-t` 超时自动停转；
+安全约束：必须显式带 `--i-am-sure`；飞控已解锁时拒绝执行；`actuator_test`
+输出默认上限 `0.05`（室内约 **600 r/min**，不修改飞控参数 `MPC_THR_MAX`）；命令带 `-t` 超时自动停转；
 Ctrl+C 立即发停止指令。有 DShot 遥测时若实际转速超过 600 r/min 会自动下调输出。
 
 **关于转速**：`actuator_test` 只接受 `-1~1` 的输出值，没有直接设定 r/min 的接口；

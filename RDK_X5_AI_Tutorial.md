@@ -1126,14 +1126,16 @@ bash /app/zettatree_demo/02_bench_pose_sim/run.sh arm:=true
 | `max_speed` | `0.1` | 模拟器跟随限速（m/s）；室内默认实飞 2 的 1/20 |
 | `rate` | `5.0` | 位姿回灌频率（Hz）；57600 UART 不宜再高 |
 
-本例程会给管理器传 `--bench`：按「非必要不改 PX4 参数」原则只写绕不开的必要 RAM 参数（视觉 `EKF2_EV_CTRL`/`EKF2_EV_DELAY`/`EKF2_HGT_REF`、上锁时机、`COM_RC_OVERRIDE=3`、限速油门），**不再放宽任何预检**（无 GPS、磁罗盘、IMU 一致性等保持默认），用姿态设定点切 OFFBOARD 后走强制解锁 21196（无遥控不能在STABILIZED 解锁）。写前会快照原值、进程退出时尽力恢复。一般不用再手写参数；若被预检拒绝，只按 QGC 回补被拒的那一项。若管理器日志里参数没写上，可另开终端：
+本例程会给管理器传 `--bench`。非必要不改 PX4 默认参数，只写三项：`EKF2_EV_CTRL=15`（融合外部视觉的位置、速度和航向）、`COM_DISARM_PRFLT=-1`（拆桨怠速不会在默认 10 秒后自动上锁）、`COM_RC_OVERRIDE=3`（OFFBOARD 下摇杆超阈值回到位置模式，默认 `1` 不管 OFFBOARD）。不改 `COM_RC_IN_MODE`（默认 3，遥控仍然有效），不写 `EKF2_EV_DELAY`、`EKF2_HGT_REF`、`COM_ARM_WO_GPS`、`EKF2_ABL_LIM` 和任何 `MPC_*`。台架转速由姿态设定点限制在约 600 r/min。用姿态设定点切 OFFBOARD 后走强制解锁 21196（无遥控不要用 STABILIZED）。写前快照原值，退出时尽力写回。PX4 会把参数存到 SD，重启不会恢复默认。一般不用再手写参数。若管理器日志里参数没写上，可另开终端：
 
 ```bash
 source /app/zettatree_demo/_common/env.sh
 ros2 service call /mavros/param/set mavros_msgs/srv/ParamSetV2 \
   "{force_set: true, param_id: 'EKF2_EV_CTRL', value: {type: 2, integer_value: 15}}"
 ros2 service call /mavros/param/set mavros_msgs/srv/ParamSetV2 \
-  "{force_set: true, param_id: 'EKF2_EV_DELAY', value: {type: 3, double_value: 5.0}}"
+  "{force_set: true, param_id: 'COM_DISARM_PRFLT', value: {type: 3, double_value: -1.0}}"
+ros2 service call /mavros/param/set mavros_msgs/srv/ParamSetV2 \
+  "{force_set: true, param_id: 'COM_RC_OVERRIDE', value: {type: 2, integer_value: 3}}"
 ```
 
 验证位姿已被飞控采信（期望 ≥ 30 Hz 且不漂移）：
@@ -1143,7 +1145,7 @@ source /app/zettatree_demo/_common/env.sh
 ros2 topic hz /mavros/local_position/pose
 ```
 
-> 详细步骤见 `/app/zettatree_demo/02_bench_pose_sim/README.md`；验证结束后重启飞控，即可清除 `EKF2_EV_CTRL` 的临时改动。
+> 详细步骤见 `/app/zettatree_demo/02_bench_pose_sim/README.md`。正常退出会写回原参数。进程若中途断开，装桨前在 QGC 把 `EKF2_EV_CTRL` 设回 `0`、`COM_DISARM_PRFLT` 设回 `10`。重启飞控不会清除这两项。
 
 ## 2.9 联调顺序
 

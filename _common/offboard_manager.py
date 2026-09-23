@@ -12,11 +12,13 @@
   /drone/status/airborne           本节点对外发布「已起飞」状态
 
 未指定 ``--arm`` 时为监视模式：持续发送「保持当前位置」设定点，不解锁、不切模式。
-指定 ``--bench`` 表示室内拆桨台架模式：只写少量绕不开的必要参数（视觉
-EKF2、上锁时机、遥控接管、限速油门），写前快照原值、退出时尽力恢复，
-再强制解锁（21196）。不放宽任何预检；重启飞控即可回到 PX4 默认。
-``COM_RC_IN_MODE`` 保持飞控默认 3。仅在已解锁且需要机载自动控制时才切
-OFFBOARD；遥控器拨杆或摇杆超阈值接管后，本节点不再抢回模式。
+指定 ``--bench`` 表示室内拆桨台架模式：只写绕不开的参数
+（``EKF2_EV_CTRL``、``COM_DISARM_PRFLT``、``COM_RC_OVERRIDE``），
+写前快照原值、退出时尽力写回。不改油门、高度参考和任何预检开关，
+再强制解锁（21196）。PX4 的参数写入会存到 SD，重启不会回到默认；
+退出若没写回，装桨前要在 QGC 核对。``COM_RC_IN_MODE`` 保持飞控默认 3。
+仅在已解锁且需要机载自动控制时才切 OFFBOARD；遥控器拨杆或摇杆超阈值
+接管后，本节点不再抢回模式。
 
 Ctrl+C 时本节点尽量请求上锁；``run.sh`` 退出时还会经串口强制上锁一次。
 
@@ -63,9 +65,9 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from indoor import (
-    ACC_DOWN, ACC_HOR, ACC_UP, BENCH_VEL_EPS, HOVER_THRUST, JERK_AUTO,
-    LAND_SPEED, MAX_MOTOR_RPM, RAMP_SECONDS, TAKEOFF_ALT_M, THR_MAX,
-    THR_MIN, TKO_SPEED, XY_VEL_MAX, Z_VEL_MAX)
+    ACC_HOR, BENCH_VEL_EPS, HOVER_THRUST, LAND_SPEED, MAX_MOTOR_RPM,
+    RAMP_SECONDS, TAKEOFF_ALT_M, THR_MAX, THR_MIN, TKO_SPEED, XY_VEL_MAX,
+    Z_VEL_MAX)
 
 # PX4 events::ID 的 FNV-1a 低 24 位；mavros 常把 EVENT <id> 打进 STATUSTEXT。
 # 用此表把拒解锁原因翻译为可读说明，避免只看见数字。
@@ -1027,21 +1029,35 @@ class OffboardManager(Node):
             self.get_logger().error(f'解锁服务调用失败: {exc}')
 
     def _enqueue_bench_params(self):
-        """组装台架参数队列：只写「室内绕不开」的项，不放宽预检。
+        """只写绕不开的参数，不放宽预检，不改油门和速度限制。
 
-        原则：非必要不改 PX4 默认参数。写前会回读并快照原值，进程退出时
-        尽力恢复；参数只写 RAM 不落盘，重启飞控即恢复默认。
+        原则：非必要不改 PX4 默认。写前回读快照，进程退出时尽力写回。
+        PARAM_SET 会自动存到 SD，重启不会回到默认。
 
-        刻意不写（保持默认，实测被拒解锁时只回补被拒的那一项）：
-        COM_RC_IN_MODE（默认 3=RC or Joystick）、COM_RCL_EXCEPT、
-        COM_ARM_WO_GPS / SYS_HAS_GPS、CBRK_IO_SAFETY / CBRK_USB_CHK、
-        COM_PREARM_MODE、COM_ARM_MIS_REQ、COM_ARM_CHK_ESCS、
-        COM_ARM_IMU_* / COM_ARM_MAG_* / SYS_HAS_MAG / EKF2_MAG_*、
-        EKF2_ABL_LIM、NAV_DLL_ACT / COM_DLL_EXCEPT（数传由 gcs_heartbeat
-        保活，不关 failsafe）、COM_ARM_AUTH_REQ。
-        解锁走强制解锁（21196），已覆盖多数预检；勿屏蔽 CAL_*_ID（会把
-        健康检查直接判 Fail）。
-        COM_RC_OVERRIDE=3：自动/OFFBOARD 下摇杆超阈值立刻回到位置模式。
+        ``COM_RC_OVERRIDE=3``：默认是 1（只在自动任务里允许摇杆接管）。
+        补上 OFFBOARD 这一位后，摇杆超阈值立刻回到位置模式。不改
+        ``COM_RC_IN_MODE``（默认 3），也不发假摇杆。
+
+        台架另写两项：
+        ``EKF2_EV_CTRL=15``：室内无 GPS，融合外部视觉的位置、速度和航向。
+        ``COM_DISARM_PRFLT=-1``：拆桨怠速达不到「已起飞」，默认 10 秒会自动上锁。
+        落地自动上锁仍用默认 ``COM_DISARM_LAND``（2 秒）。
+
+        刻意不写：
+        COM_RC_IN_MODE、COM_RCL_EXCEPT、COM_ARM_WO_GPS / SYS_HAS_GPS、
+        CBRK_IO_SAFETY / CBRK_USB_CHK、COM_PREARM_MODE、COM_ARM_MIS_REQ、
+        COM_ARM_CHK_ESCS、COM_ARM_IMU_* / COM_ARM_MAG_* / SYS_HAS_MAG /
+        EKF2_MAG_*、EKF2_ABL_LIM、NAV_DLL_ACT / COM_DLL_EXCEPT（数传由
+        gcs_heartbeat 保活，不关 failsafe）、COM_ARM_AUTH_REQ。
+        EKF2_EV_DELAY：没有实测延迟，不改默认。
+        EKF2_HGT_REF：默认 GPS。取值 3 是视觉不是测距，且要重启才生效，
+        会改掉下次开机的高度源。视觉高度仍由 EKF2_EV_CTRL 的垂直位置位融合。
+        MPC_THR_* / MPC_ACC_* / MPC_*VEL* / MPC_JERK_AUTO / MPC_LAND_SPEED /
+        MPC_TILTMAX_AIR：台架转速由姿态设定点油门限制（indoor.py）。
+        MPC_THR_MIN 默认 0.12、下限 0.05，MPC_THR_HOVER 下限 0.1；
+        室内 0.015/0.028 会被拒绝，只把 MPC_THR_MAX 改成 0.05 会让最小油门
+        大于最大油门。
+        解锁走强制解锁（21196）；勿屏蔽 CAL_*_ID（会把健康检查直接判 Fail）。
         """
         rc_takeover = [
             ('COM_RC_OVERRIDE', 3),
@@ -1053,36 +1069,14 @@ class OffboardManager(Node):
                 '已排队遥控接管参数：COM_RC_OVERRIDE=3（COM_RCL_EXCEPT 保持默认 0）')
             return
         arm_params = [
-            # 室内无 GPS：外部视觉定位是硬需求（台架由 02 回灌位姿）
-            ('EKF2_EV_CTRL', 15),   # 15=位置+速度+yaw：固定航向，避免 Heading 不稳
-            ('EKF2_EV_DELAY', 5.0),
-            ('EKF2_HGT_REF', 3),    # 高度参考：测距
-            # 拆桨怠速达不到「已起飞」判定，默认 10s 会自动上锁；负数关闭起飞前超时。
-            # 落地后仍要自动上锁停转：COM_DISARM_LAND 保持正数（秒）。
+            ('EKF2_EV_CTRL', 15),
             ('COM_DISARM_PRFLT', -1.0),
-            ('COM_DISARM_LAND', 2.0),
             *rc_takeover,
         ]
-        rest = [
-            ('MPC_THR_MIN', float(THR_MIN)),
-            ('MPC_THR_HOVER', float(HOVER_THRUST)),
-            ('MPC_THR_MAX', float(THR_MAX)),
-            ('MPC_ACC_HOR', float(ACC_HOR)),
-            ('MPC_ACC_HOR_MAX', float(ACC_HOR)),
-            ('MPC_ACC_UP_MAX', float(ACC_UP)),
-            ('MPC_ACC_DOWN_MAX', float(ACC_DOWN)),
-            ('MPC_XY_VEL_MAX', float(XY_VEL_MAX)),
-            ('MPC_Z_VEL_MAX_UP', float(Z_VEL_MAX)),
-            ('MPC_Z_VEL_MAX_DN', float(Z_VEL_MAX)),
-            ('MPC_TKO_SPEED', float(TKO_SPEED)),
-            ('MPC_JERK_AUTO', float(JERK_AUTO)),
-            ('MPC_LAND_SPEED', float(LAND_SPEED)),
-            # PX4 单位是度（不是弧度），下限 20。太小则俯仰/横滚差速几乎看不出。
-            ('MPC_TILTMAX_AIR', 25.0),
-        ]
-        self._param_queue = arm_params + rest
+        self._param_queue = list(arm_params)
         self._arm_param_names = {name for name, _v in arm_params}
-        self.get_logger().info('台架参数队列已就绪：先写解锁参数，再写油门')
+        self.get_logger().info(
+            '台架参数队列已就绪：EKF2_EV_CTRL、COM_DISARM_PRFLT、COM_RC_OVERRIDE')
 
     def _snapshot_params(self, names):
         """写前批量回读原值（尽力而为）：服务未就绪或个别失败只影响恢复，不阻塞写参。"""
@@ -1091,7 +1085,9 @@ class OffboardManager(Node):
         self._param_snapshotted = True
         if not self.param_get_cli.service_is_ready():
             self.get_logger().warn(
-                '/mavros/param/get 未就绪：本次跳过快照，退出时不恢复原值')
+                '/mavros/param/get 未就绪：本次跳过快照，退出时不恢复原值。'
+                'PX4 会把改动存到 SD；装桨前请在 QGC 核对 '
+                'EKF2_EV_CTRL（默认 0）和 COM_DISARM_PRFLT（默认 10）')
             return
         for name in names:
             req = ParamGetSrv.Request()
@@ -1115,7 +1111,10 @@ class OffboardManager(Node):
             return 0
         if not (self.param_cli.service_is_ready()
                 and self.state is not None and self.state.connected):
-            self.get_logger().warn('链路已断开：跳过参数原值恢复（重启飞控即恢复默认）')
+            self.get_logger().warn(
+                '链路已断开：跳过参数原值恢复。PX4 会把参数存到 SD，'
+                '重启不会回到默认；装桨前请在 QGC 核对 '
+                'EKF2_EV_CTRL（默认 0）和 COM_DISARM_PRFLT（默认 10）')
             return 0
         count = 0
         for name, value in self._param_originals.items():
@@ -1354,8 +1353,8 @@ class OffboardManager(Node):
                 self._arm_ready_since = self.get_clock().now()
                 self.get_logger().error(
                     '解锁参数未能及时写完，仍尝试解锁。看 FCU: 预检原文；'
-                    '本版本按「非必要不改参数」原则只写绕不开项（视觉 EKF2、上锁时机、'
-                    '遥控接管、限速油门），不再放宽 Heading/Accel Bias/磁/无 GPS 等预检。'
+                    '本版本只写 EKF2_EV_CTRL、COM_DISARM_PRFLT、COM_RC_OVERRIDE，'
+                    '不改油门、高度参考，也不放宽 Heading/Accel Bias/磁/无 GPS 等预检。'
                     '若被预检拒绝：请按安全开关、确认已拆桨，用 QGC 单独回补被拒的那一项，'
                     '不要整队恢复旧的放宽清单')
         if not self.arm_allowed:
@@ -1369,7 +1368,7 @@ class OffboardManager(Node):
             return
         if self.bench and not self._arm_params_ready:
             self.get_logger().info(
-                '等待写入无GPS/磁罗盘关闭/加速度计偏置参数后再解锁',
+                '等待写入 EKF2_EV_CTRL / COM_DISARM_PRFLT 后再解锁',
                 throttle_duration_sec=5.0)
             return
         if (self.bench and self._arm_ready_since is not None
@@ -1412,7 +1411,7 @@ def main(args=None):
                         help='允许解锁；需要自动控制时再切 OFFBOARD')
     parser.add_argument('--no-arm', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--bench', action='store_true',
-                        help='室内台架：写外部视觉参数并降低悬停油门')
+                        help='室内拆桨台架：融合外部视觉，并关闭未起飞自动上锁')
     parser.add_argument('--no-bench', action='store_true', help=argparse.SUPPRESS)
     parsed, ros_args = parser.parse_known_args(args)
     rclpy.init(args=ros_args)

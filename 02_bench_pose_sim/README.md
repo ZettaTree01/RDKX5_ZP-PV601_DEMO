@@ -22,20 +22,30 @@ bash /app/zettatree_demo/02_bench_pose_sim/run.sh arm:=true
 
 不带 `arm:=true` 时管理器处于监视模式：只发设定点，不解锁。
 
-本例程会给管理器传 `--bench`：只写绕不开的必要 RAM 参数（视觉
-`EKF2_EV_*`/`EKF2_HGT_REF`、上锁时机、`COM_RC_OVERRIDE=3`、限速油门），
-**不放宽任何预检**（无 GPS、磁、IMU 一致性等保持 PX4 默认），用姿态设定点切
-OFFBOARD 后走强制解锁 21196（无遥控不要用 STABILIZED）。写前会快照原值、
-进程退出时尽力恢复；装桨/实飞前重启飞控即可完全恢复默认。一般不用再手写参数；
-若被预检拒绝，只按 QGC 单独回补被拒的那一项。若管理器日志里 EKF2 参数没写上，
-可另开终端：
+本例程会给管理器传 `--bench`，只写三项，**不放宽任何预检**（无 GPS、磁、
+IMU 一致性等保持 PX4 默认）：
+
+| 参数 | 写入 | 默认 | 原因 |
+|---|---|---|---|
+| `EKF2_EV_CTRL` | `15` | `0` | 融合外部视觉的位置、速度和航向 |
+| `COM_DISARM_PRFLT` | `-1` | `10` | 拆桨怠速达不到「已起飞」，避免 10 秒自动上锁 |
+| `COM_RC_OVERRIDE` | `3` | `1` | OFFBOARD 下摇杆超阈值回到位置模式 |
+
+不改 `COM_RC_IN_MODE`（默认 3，遥控仍有效）。不写 `EKF2_EV_DELAY`、
+`EKF2_HGT_REF`（`3` 是视觉不是测距，且要重启才生效）、`COM_DISARM_LAND`（默认已是 2 秒）
+和任何 `MPC_*`。台架转速由姿态设定点油门限制在约 600 r/min。
+用姿态设定点切 OFFBOARD 后走强制解锁 21196（无遥控不要用 STABILIZED）。
+写前会快照原值，进程退出时尽力写回。PX4 会把参数存到 SD，**重启不会恢复默认**。
+若被预检拒绝，只按 QGC 单独回补被拒的那一项。若管理器日志里参数没写上，可另开终端：
 
 ```bash
 source /app/zettatree_demo/_common/env.sh
 ros2 service call /mavros/param/set mavros_msgs/srv/ParamSetV2 \
   "{force_set: true, param_id: 'EKF2_EV_CTRL', value: {type: 2, integer_value: 15}}"
 ros2 service call /mavros/param/set mavros_msgs/srv/ParamSetV2 \
-  "{force_set: true, param_id: 'EKF2_EV_DELAY', value: {type: 3, double_value: 5.0}}"
+  "{force_set: true, param_id: 'COM_DISARM_PRFLT', value: {type: 3, double_value: -1.0}}"
+ros2 service call /mavros/param/set mavros_msgs/srv/ParamSetV2 \
+  "{force_set: true, param_id: 'COM_RC_OVERRIDE', value: {type: 2, integer_value: 3}}"
 ```
 
 ## 启动参数
@@ -61,4 +71,4 @@ ros2 topic hz /mavros/local_position/pose
 
 - **必须拆桨**：解锁后电机按飞控指令空转。
 - 模拟出的位置只存在于飞控 EKF 内，飞机实际没有移动，不要据此判断真机位置。
-- 验证结束后重启飞控即可清除 `EKF2_EV_CTRL` 的临时改动。
+- 正常退出会写回原参数。进程若中途断开，装桨前在 QGC 核对：`EKF2_EV_CTRL` 回到 `0`，`COM_DISARM_PRFLT` 回到 `10`。重启飞控不会清除这两项。
