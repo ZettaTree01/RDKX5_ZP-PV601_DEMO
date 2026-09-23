@@ -1126,7 +1126,7 @@ bash /app/zettatree_demo/02_bench_pose_sim/run.sh arm:=true
 | `max_speed` | `0.1` | 模拟器跟随限速（m/s）；室内默认实飞 2 的 1/20 |
 | `rate` | `5.0` | 位姿回灌频率（Hz）；57600 UART 不宜再高 |
 
-本例程会给管理器传 `--bench`：自动写 `EKF2_EV_CTRL` / `COM_ARM_WO_GPS` /`EKF2_ABL_LIM` 等 RAM 参数，用姿态设定点切 OFFBOARD 后解锁（无遥控不能在STABILIZED 解锁）。一般不用再手写参数。若管理器日志里参数没写上，可另开终端：
+本例程会给管理器传 `--bench`：按「非必要不改 PX4 参数」原则只写绕不开的必要 RAM 参数（视觉 `EKF2_EV_CTRL`/`EKF2_EV_DELAY`/`EKF2_HGT_REF`、上锁时机、`COM_RC_OVERRIDE=3`、限速油门），**不再放宽任何预检**（无 GPS、磁罗盘、IMU 一致性等保持默认），用姿态设定点切 OFFBOARD 后走强制解锁 21196（无遥控不能在STABILIZED 解锁）。写前会快照原值、进程退出时尽力恢复。一般不用再手写参数；若被预检拒绝，只按 QGC 回补被拒的那一项。若管理器日志里参数没写上，可另开终端：
 
 ```bash
 source /app/zettatree_demo/_common/env.sh
