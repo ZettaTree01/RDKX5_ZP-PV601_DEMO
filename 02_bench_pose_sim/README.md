@@ -22,9 +22,13 @@ bash /app/zettatree_demo/02_bench_pose_sim/run.sh arm:=true
 
 不带 `arm:=true` 时管理器处于监视模式：只发设定点，不解锁。
 
-本例程会给管理器传 `--bench`：自动写无 GPS / 关磁罗盘 / 放宽 IMU 一致性 /
-`EKF2_ABL_LIM` 等 RAM 参数，用姿态设定点切 OFFBOARD 后解锁（无遥控不要用
-STABILIZED）。一般不用再手写参数。若管理器日志里参数没写上，可另开终端：
+本例程会给管理器传 `--bench`：只写绕不开的必要 RAM 参数（视觉
+`EKF2_EV_*`/`EKF2_HGT_REF`、上锁时机、`COM_RC_OVERRIDE=3`、限速油门），
+**不放宽任何预检**（无 GPS、磁、IMU 一致性等保持 PX4 默认），用姿态设定点切
+OFFBOARD 后走强制解锁 21196（无遥控不要用 STABILIZED）。写前会快照原值、
+进程退出时尽力恢复；装桨/实飞前重启飞控即可完全恢复默认。一般不用再手写参数；
+若被预检拒绝，只按 QGC 单独回补被拒的那一项。若管理器日志里 EKF2 参数没写上，
+可另开终端：
 
 ```bash
 source /app/zettatree_demo/_common/env.sh

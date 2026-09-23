@@ -12,7 +12,9 @@
   /drone/status/airborne           本节点对外发布「已起飞」状态
 
 未指定 ``--arm`` 时为监视模式：持续发送「保持当前位置」设定点，不解锁、不切模式。
-指定 ``--bench`` 表示室内拆桨台架模式：写入一组 RAM 参数后强制解锁（21196）。
+指定 ``--bench`` 表示室内拆桨台架模式：只写少量绕不开的必要参数（视觉
+EKF2、上锁时机、遥控接管、限速油门），写前快照原值、退出时尽力恢复，
+再强制解锁（21196）。不放宽任何预检；重启飞控即可回到 PX4 默认。
 ``COM_RC_IN_MODE`` 保持飞控默认 3。仅在已解锁且需要机载自动控制时才切
 OFFBOARD；遥控器拨杆或摇杆超阈值接管后，本节点不再抢回模式。
 
@@ -51,9 +53,11 @@ except ImportError:
 # 板端 MAVROS 2.x 的 /mavros/param/set 实际是 ParamSetV2；旧板回退 ParamSet。
 try:
     from mavros_msgs.srv import ParamSetV2 as ParamSetSrv
+    from mavros_msgs.srv import ParamGetV2 as ParamGetSrv
     _PARAM_SET_V2 = True
 except ImportError:
     from mavros_msgs.msg import ParamValue
+    from mavros_msgs.srv import ParamGet as ParamGetSrv
     from mavros_msgs.srv import ParamSet as ParamSetSrv
     _PARAM_SET_V2 = False
 
@@ -172,6 +176,8 @@ class OffboardManager(Node):
         self._param_queue = []
         self._param_sent_name = None
         self._param_sent_time = None
+        self._param_snapshotted = False   # 队列原值只回读一次
+        self._param_originals = {}        # name → 写前原值，退出时恢复
 
         # 最近飞控拒解锁相关 STATUSTEXT / EVENT（用于错误提示，勿写死 IMU）
         self._recent_fcu_fails = []
@@ -232,6 +238,7 @@ class OffboardManager(Node):
         self.home_cli = self.create_client(CommandHome, '/mavros/cmd/set_home')
         self.mode_cli = self.create_client(SetMode, '/mavros/set_mode')
         self.param_cli = self.create_client(ParamSetSrv, '/mavros/param/set')
+        self.param_get_cli = self.create_client(ParamGetSrv, '/mavros/param/get')
         self.gp_origin_pub = None
         if GeoPointStamped is not None:
             self.gp_origin_pub = self.create_publisher(
@@ -1020,59 +1027,41 @@ class OffboardManager(Node):
             self.get_logger().error(f'解锁服务调用失败: {exc}')
 
     def _enqueue_bench_params(self):
-        """组装台架参数队列：先解锁相关，再 MPC 油门/速度（可稍后失败跳过）。
+        """组装台架参数队列：只写「室内绕不开」的项，不放宽预检。
 
-        int → INTEGER，float → DOUBLE。机载端 21196 仍会跑预检，故必须先写：
-        无 GPS、关磁、放宽 IMU 一致性、外部视觉。
-        勿改写 COM_RC_IN_MODE（保持 PX4 默认 3=RC or Joystick with fallback）。
+        原则：非必要不改 PX4 默认参数。写前会回读并快照原值，进程退出时
+        尽力恢复；参数只写 RAM 不落盘，重启飞控即恢复默认。
+
+        刻意不写（保持默认，实测被拒解锁时只回补被拒的那一项）：
+        COM_RC_IN_MODE（默认 3=RC or Joystick）、COM_RCL_EXCEPT、
+        COM_ARM_WO_GPS / SYS_HAS_GPS、CBRK_IO_SAFETY / CBRK_USB_CHK、
+        COM_PREARM_MODE、COM_ARM_MIS_REQ、COM_ARM_CHK_ESCS、
+        COM_ARM_IMU_* / COM_ARM_MAG_* / SYS_HAS_MAG / EKF2_MAG_*、
+        EKF2_ABL_LIM、NAV_DLL_ACT / COM_DLL_EXCEPT（数传由 gcs_heartbeat
+        保活，不关 failsafe）、COM_ARM_AUTH_REQ。
+        解锁走强制解锁（21196），已覆盖多数预检；勿屏蔽 CAL_*_ID（会把
+        健康检查直接判 Fail）。
         COM_RC_OVERRIDE=3：自动/OFFBOARD 下摇杆超阈值立刻回到位置模式。
-        COM_RCL_EXCEPT=0：遥控丢失必须进 failsafe，OFFBOARD 不例外。
-        勿把 COM_ARM_IMU_* 写成 0（阈值 0=任何不一致都拒解锁）。
-        CBRK_IO_SAFETY 运行时写入后仍须按安全开关（或保存参数后重启飞控）。
         """
         rc_takeover = [
-            ('COM_RCL_EXCEPT', 0),
             ('COM_RC_OVERRIDE', 3),
         ]
         if not self.bench:
             self._param_queue = list(rc_takeover)
             self._arm_param_names = set()
             self.get_logger().info(
-                '已排队遥控接管参数：COM_RC_OVERRIDE=3，COM_RCL_EXCEPT=0')
+                '已排队遥控接管参数：COM_RC_OVERRIDE=3（COM_RCL_EXCEPT 保持默认 0）')
             return
         arm_params = [
-            ('COM_ARM_WO_GPS', 1),
-            ('CBRK_IO_SAFETY', 22027),
-            ('COM_PREARM_MODE', 2),
-            *rc_takeover,
-            # 台架常见拒解锁：无任务 / 无 GCS / 多 IMU 投票；尽量关掉硬依赖
-            ('COM_ARM_MIS_REQ', 0),
-            ('NAV_DLL_ACT', 0),
-            ('COM_DLL_EXCEPT', 7),  # 忽略部分模式的数传丢失（含 offboard bit，视固件）
-            ('SYS_HAS_GPS', 1),  # 允许假原点/global home；仍靠 EKF2_EV 视觉
-            ('SYS_HAS_MAG', 0),
-            ('EKF2_MAG_TYPE', 5),
-            ('EKF2_MAG_CHECK', 0),
-            ('COM_ARM_CHK_ESCS', 0),
-            ('COM_ARM_MAG_STR', 0),
-            ('COM_ARM_MAG_ANG', -1),
-            # 阈值越大越松；写成 0 会让任何 IMU 不一致都拒解锁（NavModes::All）
-            ('COM_ARM_IMU_ACC', 1.0),
-            ('COM_ARM_IMU_GYR', 0.3),
-            # 注意：不要把 CAL_ACC*_ID / CAL_GYRO*_ID 写成 0 来「屏蔽副 IMU」。
-            # 槽位清零后飞控认为该 IMU 未校准，健康检查直接把 accel 判 Fail，
-            # 整机进 ARMING_STATE_STANDBY_ERROR，连 21196 强制解锁也会被拒。
-            ('EKF2_ABL_LIM', 2.0),
-            # 15=位置+速度+yaw：台架视觉发固定航向，避免 Heading 不稳
-            ('EKF2_EV_CTRL', 15),
+            # 室内无 GPS：外部视觉定位是硬需求（台架由 02 回灌位姿）
+            ('EKF2_EV_CTRL', 15),   # 15=位置+速度+yaw：固定航向，避免 Heading 不稳
             ('EKF2_EV_DELAY', 5.0),
-            ('EKF2_HGT_REF', 3),
-            ('CBRK_USB_CHK', 197848),
-            ('COM_ARM_AUTH_REQ', 0),
+            ('EKF2_HGT_REF', 3),    # 高度参考：测距
             # 拆桨怠速达不到「已起飞」判定，默认 10s 会自动上锁；负数关闭起飞前超时。
             # 落地后仍要自动上锁停转：COM_DISARM_LAND 保持正数（秒）。
             ('COM_DISARM_PRFLT', -1.0),
             ('COM_DISARM_LAND', 2.0),
+            *rc_takeover,
         ]
         rest = [
             ('MPC_THR_MIN', float(THR_MIN)),
@@ -1094,6 +1083,52 @@ class OffboardManager(Node):
         self._param_queue = arm_params + rest
         self._arm_param_names = {name for name, _v in arm_params}
         self.get_logger().info('台架参数队列已就绪：先写解锁参数，再写油门')
+
+    def _snapshot_params(self, names):
+        """写前批量回读原值（尽力而为）：服务未就绪或个别失败只影响恢复，不阻塞写参。"""
+        if self._param_snapshotted:
+            return
+        self._param_snapshotted = True
+        if not self.param_get_cli.service_is_ready():
+            self.get_logger().warn(
+                '/mavros/param/get 未就绪：本次跳过快照，退出时不恢复原值')
+            return
+        for name in names:
+            req = ParamGetSrv.Request()
+            req.param_id = name
+            fut = self.param_get_cli.call_async(req)
+            fut.add_done_callback(
+                lambda done, n=name: self._snapshot_result(done, n))
+
+    def _snapshot_result(self, future, name):
+        """单个原值回读回调：只存成功项。"""
+        try:
+            res = future.result()
+            if res.success:
+                self._param_originals[name] = res.value
+        except Exception:
+            pass
+
+    def _restore_params(self):
+        """进程退出前尽力写回写前原值；UART 已断时静默放弃。返回请求数。"""
+        if not self._param_originals:
+            return 0
+        if not (self.param_cli.service_is_ready()
+                and self.state is not None and self.state.connected):
+            self.get_logger().warn('链路已断开：跳过参数原值恢复（重启飞控即恢复默认）')
+            return 0
+        count = 0
+        for name, value in self._param_originals.items():
+            req = ParamSetSrv.Request()
+            req.param_id = name
+            if _PARAM_SET_V2:
+                req.force_set = True
+            req.value = value
+            self.param_cli.call_async(req)
+            count += 1
+        self.get_logger().warn(f'退出恢复 {count} 个参数原值')
+        self._param_originals = {}
+        return count
 
     def _make_param_request(self, name, value):
         """按 ParamSetV2 / ParamSet 组装写参请求（int→INTEGER，float→DOUBLE）。"""
@@ -1179,6 +1214,7 @@ class OffboardManager(Node):
         if not self._param_queue:
             self._finish_params('台架参数队列为空，继续解锁流程')
             return
+        self._snapshot_params([n for n, _v in self._param_queue])
         name, value = self._param_queue[0]
         req = self._make_param_request(name, value)
         self.param_pending = True
@@ -1318,8 +1354,10 @@ class OffboardManager(Node):
                 self._arm_ready_since = self.get_clock().now()
                 self.get_logger().error(
                     '解锁参数未能及时写完，仍尝试解锁。看 FCU: 预检原文；'
-                    '室内常见 Heading/Accel Bias——已写 EKF2_MAG_TYPE=5、'
-                    'EKF2_ABL_LIM=2.0；若仍拒绝请按安全开关后重试')
+                    '本版本按「非必要不改参数」原则只写绕不开项（视觉 EKF2、上锁时机、'
+                    '遥控接管、限速油门），不再放宽 Heading/Accel Bias/磁/无 GPS 等预检。'
+                    '若被预检拒绝：请按安全开关、确认已拆桨，用 QGC 单独回补被拒的那一项，'
+                    '不要整队恢复旧的放宽清单')
         if not self.arm_allowed:
             return
         if self._pilot_override:
@@ -1397,6 +1435,14 @@ def main(args=None):
                     rclpy.spin_once(node, timeout_sec=0.1)
                     if not node.state.armed:
                         break
+        except Exception:
+            pass
+        # 上锁后再恢复写参原值，给异步写回留一点时间
+        try:
+            if node._restore_params():
+                end = time.time() + 2.0
+                while time.time() < end and rclpy.ok():
+                    rclpy.spin_once(node, timeout_sec=0.1)
         except Exception:
             pass
         try:

@@ -10,9 +10,11 @@
 H 标不在 COCO YOLO 80 类里。轮廓/圆在 CPU 上提出候选框，ROI 送到板端量化分类网（默认 `/opt/hobot/model/x5/basic/efficientnet_lite0_224x224_nv12.bin`，BPU）与合成 H 模板比对；无 BPU 时回退 NCC。
 图像断流 0.5 秒后悬停、不降落。室内最高 **600 r/min**。
 
-室内无 GPS 时 launch **默认启用台架位姿模拟**（`bench:=true`），否则飞控拒绝解锁。
-解锁参数与 05/06 共用 `_common/offboard_manager.py`（关磁罗盘、放宽 IMU
-一致性、姿态设定点进 OFFBOARD 再强制解锁）。必须拆桨；上电后仍拒解锁时按下安全开关。
+室内无 GPS 时 launch **默认启用台架位姿模拟**（`bench:=true`）。解锁参数与
+05/06 共用 `_common/offboard_manager.py`（按「非必要不改参数」原则只写视觉
+EKF2、上锁时机、遥控接管与限速油门，不放宽预检；姿态设定点进 OFFBOARD 再强制
+解锁 21196）。必须拆桨；**须物理按下安全开关**才能解锁，上电后仍拒解锁时看
+QGC 预检原文、只回补被拒的那一项。
 `Ctrl+C` 时 `run.sh` 会经 UART 再强制上锁；电机仍转时可手动执行：
 `python3 /app/zettatree_demo/_common/emergency_disarm.py`。
 
