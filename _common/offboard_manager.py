@@ -28,6 +28,7 @@ OFFBOARD → 起飞/悬停 → 转发任务。遥控接管后只维持设定点�
 import argparse
 import math
 import os
+import signal
 import sys
 import time
 
@@ -913,15 +914,16 @@ class OffboardManager(Node):
         except Exception as exc:
             self.get_logger().error(f'{mode} 服务调用失败: {exc}')
 
-    def _request_disarm(self):
-        """上锁停转。台架用强制上锁(21196)；实飞走 /mavros/cmd/arming。"""
+    def _request_disarm(self, force=False):
+        """上锁停转。force 或台架用强制上锁(21196)；实飞降落走 /mavros/cmd/arming。"""
         if self._disarm_request_pending:
             return
         now = self.get_clock().now()
-        if (self.last_disarm_request is not None
+        if (not force
+                and self.last_disarm_request is not None
                 and (now - self.last_disarm_request).nanoseconds < 1_000_000_000):
             return
-        if self.bench:
+        if force or self.bench:
             if not self.cmd_cli.service_is_ready():
                 return
             req = CommandLong.Request()
@@ -1520,6 +1522,13 @@ def main(args=None):
     parser.add_argument('--no-bench', action='store_true', help=argparse.SUPPRESS)
     parsed, ros_args = parser.parse_known_args(args)
     rclpy.init(args=ros_args)
+
+    def _stop_on_signal(_signum, _frame):
+        # SIGTERM 默认直接杀进程、不跑 finally；Ctrl+C / stop_nav 都要先上锁。
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _stop_on_signal)
+    signal.signal(signal.SIGTERM, _stop_on_signal)
     node = OffboardManager(
         parsed.altitude, parsed.arm and not parsed.no_arm,
         parsed.bench and not parsed.no_bench)
@@ -1530,9 +1539,11 @@ def main(args=None):
     finally:
         try:
             if getattr(node, 'state', None) is not None and node.state.armed:
-                node.get_logger().warn('进程退出：请求上锁停转')
+                node.get_logger().warn('进程退出：请求强制上锁停转')
                 node.landing = True
-                node._request_disarm()
+                if node.attitude_pub is not None:
+                    node.attitude_pub.publish(node._attitude_sp(0.0))
+                node._request_disarm(force=True)
                 # 给异步上锁一点时间；run.sh 退出陷阱还会经 UART 再上锁一次
                 end = time.time() + 1.5
                 while time.time() < end and rclpy.ok():

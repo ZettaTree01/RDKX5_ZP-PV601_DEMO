@@ -36,6 +36,13 @@ _term_then_kill '/app/zettatree_demo/_common/offboard_manager.py'
 _term_then_kill '/app/zettatree_demo/_common/gcs_heartbeat.py'
 _term_then_kill 'gcs_heartbeat.py'
 _term_then_kill '/app/zettatree_demo/02_bench_pose_sim/bench_pose_sim.py'
+_term_then_kill '/app/zettatree_demo/02_bench_pose_sim/bench_pose_sim.launch.py'
+_term_then_kill '/app/zettatree_demo/05_obstacle_avoidance/obstacle_avoidance.launch.py'
+_term_then_kill '/app/zettatree_demo/05_obstacle_avoidance/obstacle_avoidance.py'
+_term_then_kill 'obstacle_avoidance.py'
+_term_then_kill '/app/zettatree_demo/06_autonomous_cruise/autonomous_cruise.launch.py'
+_term_then_kill '/app/zettatree_demo/07_target_tracking/target_tracking.launch.py'
+_term_then_kill '/app/zettatree_demo/11_formation_flight/formation_flight.launch.py'
 
 # EGO / Stereonet / RViz
 _term_then_kill '/ego_planner/ego_planner_node'
@@ -83,6 +90,12 @@ for pat in \
   'offboard_manager.py' \
   'gcs_heartbeat.py' \
   'bench_pose_sim.py' \
+  'bench_pose_sim.launch.py' \
+  'obstacle_avoidance.launch.py' \
+  'obstacle_avoidance.py' \
+  'autonomous_cruise.launch.py' \
+  'target_tracking.launch.py' \
+  'formation_flight.launch.py' \
   'static_transform_publisher --frame-id map --child-frame-id world' \
   'static_transform_publisher --frame-id base_link --child-frame-id camera_link'
 do

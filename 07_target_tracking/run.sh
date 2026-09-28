@@ -8,4 +8,5 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source /app/zettatree_demo/_common/env.sh
 # shellcheck disable=SC1091
 source /app/zettatree_demo/_common/run_flight.sh
-ros2 launch "$SCRIPT_DIR/target_tracking.launch.py" "$@"
+# Ctrl+C 必须打到 shell，退出陷阱才会经串口上锁。前台 ros2 launch 会吞掉信号。
+_flight_run ros2 launch "$SCRIPT_DIR/target_tracking.launch.py" "$@"
