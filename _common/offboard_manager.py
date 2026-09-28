@@ -34,10 +34,12 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import (
+    DurabilityPolicy,
     HistoryPolicy,
     QoSProfile,
     ReliabilityPolicy,
     qos_profile_sensor_data,
+    qos_profile_services_default,
 )
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from mavros_msgs.msg import State, StatusText
@@ -52,22 +54,41 @@ except ImportError:
     GeoPointStamped = None
 
 
-# 板端 MAVROS 2.x 的 /mavros/param/set 实际是 ParamSetV2；旧板回退 ParamSet。
+# ParamGetV2 在当前 mavros_msgs 里不存在。不能和 ParamSetV2 放在同一次导入：
+# 失败会把客户端退回旧的 ParamSet，而板端服务是 ParamSetV2，service_is_ready 永远为假。
 try:
-    from mavros_msgs.srv import ParamSetV2 as ParamSetSrv
-    from mavros_msgs.srv import ParamGetV2 as ParamGetSrv
-    _PARAM_SET_V2 = True
+    from mavros_msgs.srv import ParamSetV2
 except ImportError:
+    ParamSetV2 = None
+try:
     from mavros_msgs.msg import ParamValue
-    from mavros_msgs.srv import ParamGet as ParamGetSrv
-    from mavros_msgs.srv import ParamSet as ParamSetSrv
-    _PARAM_SET_V2 = False
+    from mavros_msgs.srv import ParamGet, ParamSet
+except ImportError:
+    ParamValue = None
+    ParamGet = None
+    ParamSet = None
+
+# param 插件用 ParametersQoS 建服务。Cyclone 下默认 volatile 客户端对不上。
+MAVROS_PARAM_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1000,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from indoor import (
     ACC_HOR, BENCH_VEL_EPS, HOVER_THRUST, LAND_SPEED, MAX_MOTOR_RPM,
     RAMP_SECONDS, TAKEOFF_ALT_M, THR_MAX, THR_MIN, TKO_SPEED, XY_VEL_MAX,
     Z_VEL_MAX)
+
+# mavros sys_status 用 StateQoS：reliable + transient_local。
+# SensorDataQoS 是 best_effort，和它配不上，/mavros/state 会一直没数据，解锁不会发生。
+MAVROS_STATE_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    depth=10,
+)
 
 # PX4 events::ID 的 FNV-1a 低 24 位；mavros 常把 EVENT <id> 打进 STATUSTEXT。
 # 用此表把拒解锁原因翻译为可读说明，避免只看见数字。
@@ -161,6 +182,7 @@ class OffboardManager(Node):
         self.landing = False            # 已收到降落请求，不再解锁
         self._offboard_ticks = 0        # 连续处于 OFFBOARD 的 tick
         self._pilot_override = False    # 遥控器已接管，本会话不再 SET_MODE
+        self._self_mode = None          # 自己请求的模式，不算遥控接管
         self._rc_override_released = False
 
         # 模式/解锁服务限流（避免 UART 被刷爆）
@@ -196,7 +218,7 @@ class OffboardManager(Node):
 
         # ---- 订阅 / 发布 / 服务 ----
         self.create_subscription(
-            State, '/mavros/state', self._on_state, qos_profile_sensor_data)
+            State, '/mavros/state', self._on_state, MAVROS_STATE_QOS)
         self.create_subscription(
             PoseStamped, '/mavros/local_position/pose', self._on_pose,
             qos_profile_sensor_data)
@@ -208,15 +230,21 @@ class OffboardManager(Node):
             self._on_task_velocity, 10)
         self.create_subscription(
             Bool, '/drone/control/land', self._on_land, 10)
+        # mavros setpoint_* 订阅是 SensorDataQoS（best_effort）。
+        # 默认 reliable 发布配不上，速度和油门都到不了飞控，OFFBOARD 下电机不会转。
         self.position_pub = self.create_publisher(
-            PoseStamped, '/mavros/setpoint_position/local', 10)
+            PoseStamped, '/mavros/setpoint_position/local', qos_profile_sensor_data)
         self.velocity_pub = self.create_publisher(
-            TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10)
+            TwistStamped, '/mavros/setpoint_velocity/cmd_vel', qos_profile_sensor_data)
+        # 台架速度只给模拟器，不进飞控。飞控若收到速度，会改成 velocity offboard。
+        self.bench_vel_pub = self.create_publisher(
+            TwistStamped, '/drone/bench/cmd_vel', qos_profile_sensor_data)
         # 台架解锁前用姿态设定点：OFFBOARD 预检不要求本地点（室内无 GPS 关键）
         self.attitude_pub = None
         if AttitudeTarget is not None:
             self.attitude_pub = self.create_publisher(
-                AttitudeTarget, '/mavros/setpoint_raw/attitude', 10)
+                AttitudeTarget, '/mavros/setpoint_raw/attitude',
+                qos_profile_sensor_data)
         # 假遥控：满足「有摇杆」类检查。COM_RC_IN_MODE 保持飞控默认 3，代码不改写。
         self.manual_pub = None
         if ManualControl is not None:
@@ -239,8 +267,12 @@ class OffboardManager(Node):
         self.cmd_cli = self.create_client(CommandLong, '/mavros/cmd/command')
         self.home_cli = self.create_client(CommandHome, '/mavros/cmd/set_home')
         self.mode_cli = self.create_client(SetMode, '/mavros/set_mode')
-        self.param_cli = self.create_client(ParamSetSrv, '/mavros/param/set')
-        self.param_get_cli = self.create_client(ParamGetSrv, '/mavros/param/get')
+        # 等图里出现 /mavros/param/set 再按真实类型建客户端，避免 ParamSet/V2 对不上。
+        self.param_cli = None
+        self.param_get_cli = None
+        self._param_v2 = False
+        self._param_bind_after = 0.0
+        self._param_qos_try = 0
         self.gp_origin_pub = None
         if GeoPointStamped is not None:
             self.gp_origin_pub = self.create_publisher(
@@ -257,8 +289,10 @@ class OffboardManager(Node):
         )
         # EVENT 常只打到 mavros.sys 的 /rosout，不进 StatusText
         self.create_subscription(Log, '/rosout', self._on_rosout, 50)
+        # thrust_scaling 声明在插件节点 /mavros/setpoint_raw，不在 /mavros 上。
         self._mavros_set_param_cli = self.create_client(
-            SetParameters, '/mavros/set_parameters')
+            SetParameters, '/mavros/setpoint_raw/set_parameters',
+            qos_profile=MAVROS_PARAM_QOS)
         self._thrust_scaling_fixed = False
         if ESCTelemetry is not None:
             self.create_subscription(
@@ -286,6 +320,9 @@ class OffboardManager(Node):
         prev = (self.state.mode or '').upper()
         self.state = msg
         mode = (msg.mode or '').upper()
+        if self._self_mode and mode == self._self_mode:
+            self._self_mode = None
+            return
         if self._pilot_override:
             return
         if mode not in _PILOT_MODES:
@@ -399,7 +436,7 @@ class OffboardManager(Node):
         self._thrust_scaling_fixed = True
         req = SetParameters.Request()
         p = Parameter()
-        p.name = 'setpoint_raw.thrust_scaling'
+        p.name = 'thrust_scaling'
         p.value = ParameterValue(
             type=ParameterType.PARAMETER_DOUBLE, double_value=1.0)
         req.parameters = [p]
@@ -411,10 +448,10 @@ class OffboardManager(Node):
                 ok = all(r.successful for r in res.results)
                 if ok:
                     self.get_logger().info(
-                        '已设置 mavros setpoint_raw.thrust_scaling=1.0')
+                        '已设置 /mavros/setpoint_raw thrust_scaling=1.0')
                 else:
                     self.get_logger().warn(
-                        'thrust_scaling 无法运行时写入（将用速度设定点预热）: '
+                        'thrust_scaling 无法运行时写入，非零油门可能被 mavros 丢弃: '
                         + '; '.join(
                             r.reason for r in res.results if not r.successful))
             except Exception as exc:
@@ -583,9 +620,8 @@ class OffboardManager(Node):
           左飞 +vy → 左翼下沉 → 右电机加快、左电机减慢
           上升 +vz → 提高总距（四电机一起加快）
 
-        无水平速度时（例程 2 起飞/悬停）只发总距并忽略姿态（type_mask 含
-        IGNORE_ATTITUDE）。台架上若仍发姿态设定点，ENU↔NED 往返或 IMU 偏差
-        会变成大幅度抬头，前电机一直快于后电机。
+        无水平速度时（例程 2 起飞/悬停）保持当前姿态、只抬总距。
+        四元数必须发出：PX4 对 IGNORE_ATTITUDE 整包丢弃，电机不转。
         """
         vx, vy, vz = self._limit_body_vel(body_velocity)
         lim = max(XY_VEL_MAX, 1e-6)
@@ -594,9 +630,10 @@ class OffboardManager(Node):
             thrust = HOVER_THRUST + (THR_MAX - HOVER_THRUST) * min(1.0, vz / zlim)
         else:
             thrust = HOVER_THRUST + (THR_MIN - HOVER_THRUST) * min(1.0, -vz / zlim)
-        # 仅爬升/悬停/下降：不要姿态差速
+        # 仅爬升/悬停/下降：保持当前姿态，只抬总距。
+        # 不能置 IGNORE_ATTITUDE：PX4 看到该位会整包丢弃，油门不会进混控，电机不转。
         if abs(vx) + abs(vy) < BENCH_VEL_EPS:
-            return self._attitude_sp_quat(None, thrust, ignore_attitude=True)
+            return self._attitude_sp(thrust)
         max_tilt = 0.22  # 约 12.6°，台架可听出前后/左右差速
         # 正 pitch 经 MAVROS 后为 PX4 负俯仰（机头下俯）；负 roll 为左翼下沉。
         pitch = max_tilt * max(-1.0, min(1.0, vx / lim))
@@ -633,8 +670,13 @@ class OffboardManager(Node):
         return msg
 
     def _publish_bench_move(self, body_velocity):
-        """台架：速度给 EKF/模拟器，姿态给混控（俯仰/横滚对应差速）。"""
-        self.velocity_pub.publish(self._velocity_sp(body_velocity))
+        """台架：姿态+油门给飞控，速度只给模拟器。
+
+        速度若发给飞控，PX4 会把 offboard 模式改成 velocity。室内本地速度无效时
+        立刻判定 offboard 信号丢失并退出，电机停转。
+        """
+        if self.bench_vel_pub is not None and self.pose is not None:
+            self.bench_vel_pub.publish(self._velocity_sp(body_velocity))
         if self.attitude_pub is not None:
             self.attitude_pub.publish(self._attitude_from_body(body_velocity))
 
@@ -654,6 +696,17 @@ class OffboardManager(Node):
             msg.orientation.w = 1.0
         msg.thrust = float(max(0.0, min(1.0, thrust)))
         return msg
+
+    def _publish_bench_stick(self):
+        """台架用摇杆中位、油门最低，满足 STABILIZED 的手动输入预检。"""
+        if self.manual_pub is None:
+            return
+        msg = ManualControl()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.x = msg.y = msg.r = 0.0
+        msg.z = 0.0
+        msg.buttons = 0
+        self.manual_pub.publish(msg)
 
     def _release_rc_override(self):
         """释放 mavros RC override，避免中位覆盖真遥控通道。"""
@@ -844,6 +897,7 @@ class OffboardManager(Node):
             return
         req = SetMode.Request()
         req.custom_mode = mode
+        self._self_mode = mode.upper()
         self.mode_request_pending = True
         self.last_mode_request = now
         self.get_logger().info(f'请求切 {mode}')
@@ -1071,26 +1125,31 @@ class OffboardManager(Node):
         arm_params = [
             ('EKF2_EV_CTRL', 15),
             ('COM_DISARM_PRFLT', -1.0),
+            ('COM_RC_IN_MODE', 1),  # 只认 MAVLink 摇杆。默认 3 会锁死先出现的 RC
+            ('SYS_HAS_MAG', 0),     # 室内罗盘预检失败会禁止所有模式解锁
             *rc_takeover,
         ]
         self._param_queue = list(arm_params)
         self._arm_param_names = {name for name, _v in arm_params}
+        self._param_originals.setdefault('COM_RC_IN_MODE', 3)
+        self._param_originals.setdefault('SYS_HAS_MAG', 1)
         self.get_logger().info(
-            '台架参数队列已就绪：EKF2_EV_CTRL、COM_DISARM_PRFLT、COM_RC_OVERRIDE')
+            '台架参数队列已就绪：EKF2_EV_CTRL、COM_DISARM_PRFLT、'
+            'COM_RC_IN_MODE=1、SYS_HAS_MAG=0、COM_RC_OVERRIDE')
 
     def _snapshot_params(self, names):
         """写前批量回读原值（尽力而为）：服务未就绪或个别失败只影响恢复，不阻塞写参。"""
         if self._param_snapshotted:
             return
         self._param_snapshotted = True
-        if not self.param_get_cli.service_is_ready():
+        if self.param_get_cli is None or not self.param_get_cli.service_is_ready():
             self.get_logger().warn(
                 '/mavros/param/get 未就绪：本次跳过快照，退出时不恢复原值。'
                 'PX4 会把改动存到 SD；装桨前请在 QGC 核对 '
                 'EKF2_EV_CTRL（默认 0）和 COM_DISARM_PRFLT（默认 10）')
             return
         for name in names:
-            req = ParamGetSrv.Request()
+            req = self.param_get_cli.srv_type.Request()
             req.param_id = name
             fut = self.param_get_cli.call_async(req)
             fut.add_done_callback(
@@ -1109,7 +1168,7 @@ class OffboardManager(Node):
         """进程退出前尽力写回写前原值；UART 已断时静默放弃。返回请求数。"""
         if not self._param_originals:
             return 0
-        if not (self.param_cli.service_is_ready()
+        if not (self.param_cli is not None and self.param_cli.service_is_ready()
                 and self.state is not None and self.state.connected):
             self.get_logger().warn(
                 '链路已断开：跳过参数原值恢复。PX4 会把参数存到 SD，'
@@ -1118,22 +1177,70 @@ class OffboardManager(Node):
             return 0
         count = 0
         for name, value in self._param_originals.items():
-            req = ParamSetSrv.Request()
-            req.param_id = name
-            if _PARAM_SET_V2:
-                req.force_set = True
-            req.value = value
+            req = self._make_param_request(name, value)
             self.param_cli.call_async(req)
             count += 1
         self.get_logger().warn(f'退出恢复 {count} 个参数原值')
         self._param_originals = {}
         return count
 
+    def _service_type_names(self, service_name):
+        """返回图中该服务的类型名列表；服务还没出现时为空。"""
+        for name, types in self.get_service_names_and_types():
+            if name == service_name:
+                return list(types)
+        return []
+
+    def _ensure_param_cli(self):
+        """按图中真实类型接通 /mavros/param/set。
+
+        板端服务是 ParamSetV2，且用 transient_local。类型或 QoS 不对时
+        service_is_ready 会一直为假，解锁参数写不出去。
+        """
+        if self.param_cli is not None and self.param_cli.service_is_ready():
+            return True
+        now = time.monotonic()
+        if now < self._param_bind_after:
+            return False
+        types = self._service_type_names('/mavros/param/set')
+        if not types:
+            self._param_bind_after = now + 1.0
+            self.get_logger().warn(
+                '参数服务 /mavros/param/set 尚未出现',
+                throttle_duration_sec=2.0)
+            return False
+        type_name = types[0]
+        use_v2 = type_name.endswith('ParamSetV2')
+        srv_cls = ParamSetV2 if use_v2 else ParamSet
+        if srv_cls is None:
+            self._param_bind_after = now + 5.0
+            self.get_logger().error(
+                f'参数服务类型是 {type_name}，当前 Python 的 mavros_msgs 没有这个类型，'
+                '无法写 EKF2_EV_CTRL')
+            return False
+        qos = (MAVROS_PARAM_QOS if self._param_qos_try % 2 == 0
+               else qos_profile_services_default)
+        if self.param_cli is not None:
+            self.destroy_client(self.param_cli)
+            self.param_cli = None
+        self.param_cli = self.create_client(
+            srv_cls, '/mavros/param/set', qos_profile=qos)
+        self._param_v2 = use_v2
+        self._param_qos_try += 1
+        self._param_bind_after = now + 1.5
+        qos_name = 'transient_local' if qos is MAVROS_PARAM_QOS else 'default'
+        self.get_logger().info(
+            f'接通参数服务 {type_name} qos={qos_name}')
+        if (not use_v2 and ParamGet is not None and self.param_get_cli is None):
+            self.param_get_cli = self.create_client(
+                ParamGet, '/mavros/param/get', qos_profile=qos)
+        return self.param_cli.service_is_ready()
+
     def _make_param_request(self, name, value):
         """按 ParamSetV2 / ParamSet 组装写参请求（int→INTEGER，float→DOUBLE）。"""
-        req = ParamSetSrv.Request()
+        req = self.param_cli.srv_type.Request()
         req.param_id = name
-        if _PARAM_SET_V2:
+        if self._param_v2:
             # MAVROS 2.x：/mavros/param/set 实际类型是 ParamSetV2。
             # force_set：UART 上参数表可能还没拉完，也要把解锁参数送出去。
             req.force_set = True
@@ -1197,15 +1304,9 @@ class OffboardManager(Node):
             return
         if not self.state.connected:
             return
-        if not self.param_cli.service_is_ready():
-            try:
-                self.param_cli.wait_for_service(timeout_sec=0.2)
-            except Exception:
-                pass
-        if not self.param_cli.service_is_ready():
-            kind = 'ParamSetV2' if _PARAM_SET_V2 else 'ParamSet'
+        if not self._ensure_param_cli():
             self.get_logger().warn(
-                f'参数服务 /mavros/param/set ({kind}) 尚未就绪',
+                '参数服务 /mavros/param/set 尚未就绪',
                 throttle_duration_sec=2.0)
             return
         if not self._param_queue:
@@ -1265,41 +1366,41 @@ class OffboardManager(Node):
         airborne_msg.data = self.airborne
         self.airborne_pub.publish(airborne_msg)
 
-        if self.pose is not None and self.hold_target is not None:
+        if self.bench and not self.landing:
+            self._publish_bench_stick()
+            # 解锁前就发姿态+油门。只发速度时 PX4 记成 velocity offboard，
+            # 室内本地速度无效会拒绝进 OFFBOARD，之后油门分支根本不会走到。
+            offboard = self.state.mode == 'OFFBOARD'
+            if offboard:
+                self._offboard_ticks += 1
+            else:
+                self._offboard_ticks = 0
+            if not self.state.armed or not offboard:
+                self._fix_mavros_thrust_scaling()
+                self._ensure_px4_home()
+                self._release_rc_override()
+                if self.attitude_pub is not None:
+                    self.attitude_pub.publish(self._attitude_sp(THR_MAX))
+            elif not self.airborne:
+                self._publish_bench_move(self._bench_takeoff_vel())
+            else:
+                if not self._hover_captured and self.pose is not None:
+                    self.hold_target = self.pose[:3]
+                    self._hover_captured = True
+                body = self._active_bench_vel()
+                if body is not None:
+                    self._publish_bench_move(body)
+                else:
+                    self._publish_bench_move((0.0, 0.0, 0.0))
+                if not self._logged_hover:
+                    self.get_logger().info(
+                        '台架悬停：保持转速，有速度/位置任务时再加速，'
+                        f'最高 {MAX_MOTOR_RPM} r/min')
+                    self._logged_hover = True
+            self.setpoint_ticks += 1
+        elif self.pose is not None and self.hold_target is not None:
             if self.landing:
                 self._handle_landing()
-            elif self.bench:
-                # 解锁前只发设定点预热，不覆盖真遥控。COM_RC_IN_MODE 保持默认 3。
-                offboard = self.state.mode == 'OFFBOARD'
-                if offboard:
-                    self._offboard_ticks += 1
-                else:
-                    self._offboard_ticks = 0
-                if not self.state.armed or not offboard:
-                    self._fix_mavros_thrust_scaling()
-                    self._ensure_px4_home()
-                    self._release_rc_override()
-                    # mavros setpoint_raw 在 thrust_scaling=NaN 时会丢弃非零 thrust，
-                    # 导致飞控报 No offboard signal。预热一律用速度设定点。
-                    self.velocity_pub.publish(
-                        self._velocity_sp((0.0, 0.0, 0.0)))
-                elif not self.airborne:
-                    self._publish_bench_move(self._bench_takeoff_vel())
-                else:
-                    if not self._hover_captured and self.pose is not None:
-                        self.hold_target = self.pose[:3]
-                        self._hover_captured = True
-                    body = self._active_bench_vel()
-                    if body is not None:
-                        self._publish_bench_move(body)
-                    else:
-                        self._publish_bench_move((0.0, 0.0, 0.0))
-                    if not self._logged_hover:
-                        self.get_logger().info(
-                            '台架悬停：保持转速，有速度/位置任务时再加速，'
-                            f'最高 {MAX_MOTOR_RPM} r/min')
-                        self._logged_hover = True
-                self.setpoint_ticks += 1
             elif self.airborne and self._task_is_fresh():
                 if (self._stamp_fresh(self.task_vel_time)
                         and self.task_velocity_body is not None):
@@ -1361,7 +1462,7 @@ class OffboardManager(Node):
             return
         if self._pilot_override:
             return
-        if self.pose is None or self.setpoint_ticks < 40:
+        if self.setpoint_ticks < 40 or (not self.bench and self.pose is None):
             self.get_logger().info(
                 '等待位姿与设定点预热后再解锁',
                 throttle_duration_sec=5.0)
@@ -1378,7 +1479,11 @@ class OffboardManager(Node):
                 '解锁参数已写入，等待 EKF 刷新偏航/home/原点（约 10s）',
                 throttle_duration_sec=2.0)
             return
-        # 保持当前遥控模式解锁；需要自动控制且遥控未接管时再切 OFFBOARD。
+        # AUTO.LOITER 预检不允许解锁。外部 21196 仍会跑健康检查，先切可解锁的 STABILIZED。
+        if (self.bench and not self.state.armed
+                and (self.state.mode or '').upper() != 'STABILIZED'):
+            self._request_mode('STABILIZED')
+            return
         if not self.state.armed:
             self._request_arm()
             return

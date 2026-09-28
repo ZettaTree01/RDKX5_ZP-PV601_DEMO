@@ -651,40 +651,18 @@ X5 与飞控主板ZP-PV601之间**统一使用 40PIN UART2 针脚串口**连接�
 
 ### 1.4.1 软件环境准备
 
-#### 基础软件
+官方系统镜像已经安装地平线 TogetheROS Humble，路径是 `/opt/tros/humble`。本教程只使用这一套 ROS2。`/opt/ros/humble` 是 TROS 带进来的依赖层，不要再单独 `source`，也不要另装一套 ROS2。
+
+确认镜像里已经有 TROS：
 
 ```bash
-# 1. SSH 连接到 RDK X5
 ssh sunrise@<板卡IP>
-
-# 2. 设置 ROS2 / TogetheROS。tros 的 setup 已叠加 Humble，一般只 source 这一行
-echo "source /opt/tros/humble/setup.bash" >> ~/.bashrc
-source ~/.bashrc
+test -f /opt/tros/humble/setup.bash && echo "TROS OK"
 ```
 
-#### 安装飞控相关软件
+飞控相关的 MAVROS、Python 依赖和串口权限交给一键体检，不要手装。体检发现 `/opt/tros/humble` 就跳过安装 TROS，只补缺失项：RMW、`cv_bridge`、RViz、`mavros_msgs`，以及 MAVROS 节点。jammy/arm64 的 apt 经常没有 `ros-humble-mavros`，`bash 00_env_check/run.sh --yes` 会源码编译到 `mavros_ws/`，并把 GeographicLib 数据集装上，同时把当前用户加入 `dialout`。不带 `--yes` 时只检查，不会自动编译 MAVROS。
 
-```bash
-# 1) 消息包（arm64 apt 通常有）
-sudo apt update
-sudo apt install -y ros-humble-mavros-msgs ros-humble-mavlink
-
-# 2) MAVROS 节点：镜像/apt 已有则直接用；jammy/arm64 常无 deb 时源码编译
-ros2 pkg prefix mavros || \
-  bash /app/zettatree_demo/00_env_check/setup_mavros.sh
-# 源码产物：/app/zettatree_demo/mavros_ws/install
-# （一键体检 bash .../00_env_check/run.sh --yes 会自动处理）
-
-# 串口访问权限；执行后重新登录
-sudo usermod -aG dialout "$USER"
-
-# GeographicLib 脚本位置以实际安装前缀为准
-source /opt/tros/humble/setup.bash
-source /app/zettatree_demo/mavros_ws/install/setup.bash 2>/dev/null || true
-MAVROS_PREFIX="$(ros2 pkg prefix mavros)"
-sudo "$MAVROS_PREFIX/lib/mavros/install_geographiclib_datasets.sh" || \
-sudo "$MAVROS_PREFIX/share/mavros/scripts/install_geographiclib_datasets.sh"
-```
+`~/.bashrc` 由体检写入 `source /app/zettatree_demo/_common/env.sh`。这一行会加载 TROS，再叠加 MAVROS 与 EGO 的 overlay。不要改成只 `source /opt/tros/humble/setup.bash`，否则后两层不会进来。部署例程后的命令见 1.4.2。
 
 ### 1.4.2 部署配套例程
 
@@ -699,9 +677,10 @@ scp -r 02 sunrise@<X5_IP>:/app/zettatree_demo
 
 ```bash
 cd /app/zettatree_demo
-python3 00_env_check/env_check.py
-python3 00_env_check/verify_ros_imports.py
+bash 00_env_check/run.sh --yes
 ```
+
+成功时最后一行是 `READY`。只检查、不安装时用 `bash 00_env_check/run.sh --check-only`。
 
 ### 1.4.3 验证环境
 
@@ -709,11 +688,12 @@ python3 00_env_check/verify_ros_imports.py
 # X5↔飞控统一 40PIN UART2（未使能时先按 1.2.7 使能并重启）
 ls -l /dev/ttyS2
 
-# 启动 MAVROS
+# 启动 MAVROS（先加载 TROS，并带上 MAVROS overlay）
+source /app/zettatree_demo/_common/env.sh
 ros2 launch mavros px4.launch fcu_url:=/dev/ttyS2:57600
 
-# 新终端确认 FCU 心跳和本地位置
-source /opt/tros/humble/setup.bash
+# 新终端同样先 source，再确认 FCU 心跳和本地位置
+source /app/zettatree_demo/_common/env.sh
 ros2 topic echo --once /mavros/state
 ros2 topic echo --once /mavros/local_position/pose
 ```
@@ -740,7 +720,7 @@ ros2 topic echo --once /mavros/local_position/pose
 └── _common/                    # 含 indoor.py：室内调试把电机/速度压到 1/20
 ```
 
-其中 `00_env_check` 是环境自检例程：不接飞控、不接线也能运行，`env_check.py` 检查 Python 依赖、40PIN UART2 串口（`/dev/ttyS2`）、ROS2/MAVROS 与 YOLO 模型是否就绪，`verify_ros_imports.py` 逐项导入感知相关 Python 模块；**跑任何飞行例程前先过这一关**。
+其中 `00_env_check` 是环境自检例程：不接飞控、不接线也能运行。官方镜像已带地平线 ROS2 时不重装 TROS。`run.sh --yes` 检查并补齐 Python 依赖、40PIN UART2 串口（`/dev/ttyS2`）、MAVROS 与 YOLO 模型；**跑任何飞行例程前先过这一关**。
 
 每个目录的 `README.md` 给出独立运行命令。后续若要做成正式 ROS2 package，再创建 colcon 工作空间，不要把空工作空间当作本教程例程的运行前置。
 
@@ -872,14 +852,12 @@ COM_OBL_RC_ACT    # OFFBOARD 失联动作
 
 ```bash
 ssh sunrise@<X5_IP>
-source /opt/tros/humble/setup.bash
-
-ros2 pkg prefix mavros || \
-  bash /app/zettatree_demo/00_env_check/setup_mavros.sh
-sudo usermod -aG dialout "$USER"
+test -f /opt/tros/humble/setup.bash && echo "TROS OK"
 ```
 
-重新登录后，从开发电脑部署例程：
+官方镜像已有地平线 ROS2。一键体检发现 `/opt/tros/humble` 就跳过安装，只补缺失依赖和 MAVROS。
+
+在开发电脑执行：
 
 ```bash
 scp -r 02 sunrise@<X5_IP>:/app/zettatree_demo
@@ -888,8 +866,7 @@ scp -r 02 sunrise@<X5_IP>:/app/zettatree_demo
 在 X5 上执行：
 
 ```bash
-python3 /app/zettatree_demo/00_env_check/env_check.py
-python3 /app/zettatree_demo/00_env_check/verify_ros_imports.py
+bash /app/zettatree_demo/00_env_check/run.sh --yes
 ```
 
 若自检只报告 MAVROS 运行库缺失，更新匹配的 ROS2 依赖后重跑：
@@ -903,13 +880,14 @@ sudo apt install --only-upgrade ros-humble-diagnostic-updater
 启动 MAVROS（链路为 1.2.7 所述 UART2）：
 
 ```bash
-source /opt/tros/humble/setup.bash
+source /app/zettatree_demo/_common/env.sh
 ros2 launch mavros px4.launch fcu_url:=/dev/ttyS2:57600
 ```
 
 新终端执行：
 
 ```bash
+source /app/zettatree_demo/_common/env.sh
 ros2 topic echo --once /mavros/state
 ros2 topic echo --once /mavros/local_position/pose
 ros2 topic hz /mavros/local_position/pose
@@ -934,8 +912,8 @@ ros2 topic hz /mavros/local_position/pose
 关键常量定义见 [`_common/indoor.py`](https://github.com/ZettaTree01/RDKX5_PX4_DEMO/blob/main/_common/indoor.py)：`INDOOR_SPEED_SCALE = 0.05`（速度/高度为实飞 1/20）、最高转速 `MAX_MOTOR_RPM = 600`。
 
 **① 每个 `run.sh` 会自动加载环境，不必手动 `source`。**
-脚本内部会执行 `source /app/zettatree_demo/_common/env.sh`（优先 `/opt/tros/humble/setup.bash`，其次 `/opt/ros/humble/setup.bash`）。所以用 `bash xxx/run.sh` 启动时**不用先 source**；
-只有当你自己直接敲 `ros2 ...` 命令（例如 `ros2 topic echo`）时，才需要先`source /opt/tros/humble/setup.bash`。
+脚本内部会执行 `source /app/zettatree_demo/_common/env.sh`。该脚本只加载地平线 TogetheROS（`/opt/tros/humble/setup.bash`），再叠加 `mavros_ws` / `ego_ws`；找不到 TROS 就失败，不会改去 `source /opt/ros/humble/setup.bash`。所以用 `bash xxx/run.sh` 启动时**不用先 source**；
+只有当你自己直接敲 `ros2 ...` 命令（例如 `ros2 topic echo`）时，才需要先 `source /app/zettatree_demo/_common/env.sh`。
 
 **② 每个飞行例程都是「一条命令拉起全部」。**
 `run.sh` 内部执行 `ros2 launch <例程>.launch.py`，该 launch **自己**会拉起 MAVROS、OFFBOARD 管理器和本任务节点（相机类例程还会拉起相机节点）。所以：
@@ -959,11 +937,10 @@ ros2 topic hz /mavros/local_position/pose
 **进阶：只调试单个任务节点**（MAVROS 与管理器已由别的终端提供时）：
 `source /app/zettatree_demo/_common/env.sh && python3 <例程目录>/<节点>.py`。
 
-**③ 跑任何例程前，先过环境自检（不接飞控、不接线也能跑）。**
+**③ 跑任何例程前，先过环境自检（不接飞控、不接线也能跑）。** 官方镜像已带地平线 ROS2 时，这条命令不重装 TROS，只补缺失依赖和 MAVROS。
 
 ```bash
-python3 /app/zettatree_demo/00_env_check/env_check.py
-python3 /app/zettatree_demo/00_env_check/verify_ros_imports.py
+bash /app/zettatree_demo/00_env_check/run.sh --yes
 ```
 
 **④ 怎么判断「真的跑起来了」。**

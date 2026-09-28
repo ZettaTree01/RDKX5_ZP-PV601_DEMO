@@ -53,12 +53,14 @@ class BenchPoseSim(Node):
         # 回灌外部视觉位姿给飞控 EKF
         self.pub = self.create_publisher(
             PoseStamped, '/mavros/vision_pose/pose', 10)
+        # 与管理器、mavros 一致：设定点是 best_effort，reliable 订阅收不到
         self.create_subscription(
             PoseStamped, '/mavros/setpoint_position/local',
-            self._on_setpoint, 10)
+            self._on_setpoint, qos_profile_sensor_data)
+        # 管理器把台架速度发到这里，避免飞控把 offboard 改成 velocity 后退出
         self.create_subscription(
-            TwistStamped, '/mavros/setpoint_velocity/cmd_vel',
-            self._on_velocity, 10)
+            TwistStamped, '/drone/bench/cmd_vel',
+            self._on_velocity, qos_profile_sensor_data)
         self.create_subscription(
             PoseStamped, '/mavros/local_position/pose',
             self._on_local, qos_profile_sensor_data)
