@@ -208,23 +208,30 @@ class AutonomousCruiseNode(Node):
             return
         if self.wp_idx >= len(self.waypoints):
             # 保持最后一个航点设定点，同时请求管理器降落上锁
-            self._publish_sp(*self.waypoints[-1])
+            lx, ly, lz = self.waypoints[-1]
+            if self.current_position is not None:
+                lz = float(self.current_position.z)
+            self._publish_sp(lx, ly, lz)
             msg = Bool()
             msg.data = True
             self.land_pub.publish(msg)
             return
-        x, y, z = self.waypoints[self.wp_idx]
-        self._publish_sp(x, y, z)
+        x, y, _z = self.waypoints[self.wp_idx]
         if self.current_position is None:
             return
-        d2 = ((self.current_position.x - x) ** 2
-              + (self.current_position.y - y) ** 2
-              + (self.current_position.z - z) ** 2)
-        # 到达半径随边长缩放，最小 2 cm（台架边长很短时仍可到点）
-        arrive = max(0.02, CRUISE_SIDE_M * 0.3)
-        if d2 < arrive * arrive:
+        # 台架气压/视觉高度会漂，航点只跟 XY；高度跟当前，避免无尽地爬高度
+        z = float(self.current_position.z)
+        self._publish_sp(x, y, z)
+        dist_xy = math.hypot(
+            self.current_position.x - x, self.current_position.y - y)
+        # 与例程 09 一致：只判水平到位；半径随边长缩放，最小 3 cm
+        arrive = max(0.03, CRUISE_SIDE_M * 0.3)
+        if dist_xy < arrive:
             self.capture_image()
             self.wp_idx += 1
+            self.get_logger().info(
+                f'到达航点 {self.wp_idx}/{len(self.waypoints)}'
+                f'（水平 {dist_xy:.3f} m）')
 
     def destroy_node(self):
         """关闭画面输出后销毁节点。"""
